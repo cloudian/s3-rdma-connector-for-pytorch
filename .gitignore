@@ -1,0 +1,14 @@
+build/
+*.egg-info
+__pycache__
+cufile.log
+.pytest_cache
+.env
+.venv
+multirun/
+outputs/
+.vscode/launch.json
+s3-connector-for-pytorch
+s3cutorchbenchmarking/conf
+s3cutorchbenchmarking/utils
+s3cutorchbenchmarking/src

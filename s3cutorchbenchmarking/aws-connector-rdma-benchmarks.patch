@@ -1,0 +1,252 @@
+diff --git a/s3torchbenchmarking/conf/dataloader/s3iterabledataset-rdma.yaml b/s3torchbenchmarking/conf/dataloader/s3iterabledataset-rdma.yaml
+new file mode 100644
+index 0000000..2d373b7
+--- /dev/null
++++ b/s3torchbenchmarking/conf/dataloader/s3iterabledataset-rdma.yaml
+@@ -0,0 +1,4 @@
++kind: s3iterabledataset
++batch_size: 128
++num_workers: 8
++rdma: true
+diff --git a/s3torchbenchmarking/conf/dataset.yaml b/s3torchbenchmarking/conf/dataset.yaml
+index 69f65b4..65d086c 100644
+--- a/s3torchbenchmarking/conf/dataset.yaml
++++ b/s3torchbenchmarking/conf/dataset.yaml
+@@ -30,7 +30,7 @@ hydra:
+     params:
+       # Name of a model (valid options: "entitlement", "vit").
+       +model: entitlement
+-      # Kind of the dataloader (valid options: "fsspec", "s3iterabledataset", "mountpoint", "mountpointcache").
++      # Kind of the dataloader (valid options: "fsspec", "s3iterabledataset", "s3iterabledataset-rdma", "mountpoint", "mountpointcache").
+       +dataloader: fsspec, s3iterabledataset, mountpoint, mountpointcache
+       # Dataset name (corresponds to the name of a folder in S3); will be used to build an S3 URI
+       +dataset: 100k_496x387_images
+diff --git a/s3torchbenchmarking/conf/dcp.yaml b/s3torchbenchmarking/conf/dcp.yaml
+index 0aa5b3b..d759fea 100644
+--- a/s3torchbenchmarking/conf/dcp.yaml
++++ b/s3torchbenchmarking/conf/dcp.yaml
+@@ -26,5 +26,5 @@ hydra:
+       +world_size: 4
+       # Number of threads to use for saving the checkpoints.
+       +thread_count: 4
+-      # Checkpoint storage location (valid options: "disk", "s3").
++      # Checkpoint storage location (valid options: "disk", "s3", "s3rdma").
+       +checkpoint.storage: disk, s3
+diff --git a/s3torchbenchmarking/conf/lightning_checkpointing.yaml b/s3torchbenchmarking/conf/lightning_checkpointing.yaml
+index 51b8a04..0440689 100644
+--- a/s3torchbenchmarking/conf/lightning_checkpointing.yaml
++++ b/s3torchbenchmarking/conf/lightning_checkpointing.yaml
+@@ -21,5 +21,5 @@ hydra:
+     params:
+       # Short name of a pre-trained model (from Hugging Face), listed in `models.py`.
+       +model: clip-vit, T0_3B, T0pp
+-      # Checkpoint storage location (valid options: "disk", "s3").
++      # Checkpoint storage location (valid options: "disk", "s3", "s3rdma").
+       +checkpoint.storage: disk, s3
+diff --git a/s3torchbenchmarking/conf/pytorch_checkpointing.yaml b/s3torchbenchmarking/conf/pytorch_checkpointing.yaml
+index d8d9136..3a5c326 100644
+--- a/s3torchbenchmarking/conf/pytorch_checkpointing.yaml
++++ b/s3torchbenchmarking/conf/pytorch_checkpointing.yaml
+@@ -21,5 +21,5 @@ hydra:
+     params:
+       # Short name of a pre-trained model (from Hugging Face), listed in `models.py`.
+       +model: vit-base, whisper, clip-vit, T0_3B, T0pp
+-      # Checkpoint storage location (valid options: "disk", "s3").
++      # Checkpoint storage location (valid options: "disk", "s3", "s3rdma").
+       +checkpoint.storage: disk, s3
+diff --git a/s3torchbenchmarking/src/s3torchbenchmarking/dataset/benchmark.py b/s3torchbenchmarking/src/s3torchbenchmarking/dataset/benchmark.py
+index 4e9e9e2..0a13169 100644
+--- a/s3torchbenchmarking/src/s3torchbenchmarking/dataset/benchmark.py
++++ b/s3torchbenchmarking/src/s3torchbenchmarking/dataset/benchmark.py
+@@ -21,6 +21,7 @@ from s3torchbenchmarking.models import (
+ )
+ from s3torchconnector import S3MapDataset, S3Reader, S3IterableDataset
+ from s3torchconnector._s3dataset_common import parse_s3_uri  # type: ignore
++import s3cutorchconnector  # type: ignore
+ 
+ 
+ # TODO: add Structured Config (https://hydra.cc/docs/tutorials/structured_config/intro/)
+@@ -34,6 +35,7 @@ def run_experiment(config: DictConfig) -> dict:
+ 
+     dataset = make_dataset(
+         kind=config.dataloader.kind,
++        rdma=config.dataloader.get("rdma", False),
+         sharding=config.sharding,
+         prefix_uri=fully_qualified_uri,
+         region=config.s3.region,
+@@ -90,6 +92,7 @@ def make_mountpoint(
+ 
+ def make_dataset(
+     kind: str,
++    rdma: bool,
+     sharding: bool,
+     prefix_uri: str,
+     region: Optional[str],
+@@ -97,15 +100,15 @@ def make_dataset(
+     num_workers: int,
+ ):
+     if kind == "s3iterabledataset":
+-        if not region:
++        if not region and not rdma:
+             raise ValueError("Must provide region for s3iterabledataset")
+         return create_s3_iterable_dataset(
+-            sharding, prefix_uri, region, load_sample, num_workers
++            sharding, prefix_uri, region, load_sample, num_workers, rdma
+         )
+     if kind == "s3mapdataset":
+         if not region:
+             raise ValueError("Must provide region for s3mapdataset")
+-        return create_s3_map_dataset(sharding, prefix_uri, region, load_sample)
++        return create_s3_map_dataset(sharding, prefix_uri, region, load_sample, rdma)
+     if kind == "fsspec":
+         return create_fsspec_dataset(sharding, prefix_uri, load_sample, num_workers)
+     if kind == "mountpoint":
+@@ -120,9 +123,12 @@ def make_dataset(
+ 
+ 
+ def create_s3_iterable_dataset(
+-    sharding: bool, prefix_uri: str, region: str, load_sample, num_workers: int
++    sharding: bool, prefix_uri: str, region: str, load_sample, num_workers: int, rdma: bool
+ ):
+-    dataset = S3IterableDataset.from_prefix(prefix_uri, region=region)
++    if rdma:
++        dataset = s3cutorchconnector.S3IterableDataset.from_prefix(prefix_uri, region=region)
++    else:
++        dataset = S3IterableDataset.from_prefix(prefix_uri, region=region)
+     dataset = torchdata.datapipes.iter.IterableWrapper(dataset)
+ 
+     if num_workers > 0:
+@@ -134,13 +140,18 @@ def create_s3_iterable_dataset(
+     return dataset.map(load_sample)
+ 
+ 
+-def create_s3_map_dataset(sharding: bool, prefix_uri: str, region: str, load_sample):
++def create_s3_map_dataset(sharding: bool, prefix_uri: str, region: str, load_sample, rdma: bool):
+     if sharding:
+         raise ValueError("Sharding is not supported for s3mapdataset")
+     else:
+-        dataset = S3MapDataset.from_prefix(
+-            prefix_uri, region=region, transform=load_sample
+-        )
++        if rdma:
++            dataset = s3cutorchconnector.S3MapDataset.from_prefix(
++                prefix_uri, region=region, transform=load_sample
++            )            
++        else:
++            dataset = S3MapDataset.from_prefix(
++                prefix_uri, region=region, transform=load_sample
++            )
+     return dataset
+ 
+ 
+diff --git a/s3torchbenchmarking/src/s3torchbenchmarking/dcp/benchmark.py b/s3torchbenchmarking/src/s3torchbenchmarking/dcp/benchmark.py
+index a43020e..e1c137b 100644
+--- a/s3torchbenchmarking/src/s3torchbenchmarking/dcp/benchmark.py
++++ b/s3torchbenchmarking/src/s3torchbenchmarking/dcp/benchmark.py
+@@ -25,6 +25,7 @@ from s3torchbenchmarking.benchmark_utils import (
+ )
+ from s3torchbenchmarking.models import get_benchmark_model
+ from s3torchconnector.dcp import S3StorageWriter
++from s3cutorchconnector.dcp import S3StorageWriter as S3CuStorageWriter
+ 
+ Timestamps = Tuple[float, float]
+ logger = logging.getLogger(__name__)
+@@ -87,6 +88,10 @@ def get_writer(cfg: DictConfig) -> FileSystemWriter:
+         uri = build_checkpoint_uri(cfg.s3.uri, suffix)
+         logger.info("Saving checkpoint to %s (S3)...", uri)
+         return S3StorageWriter(cfg.s3.region, uri, thread_count=cfg.thread_count)
++    elif cfg.checkpoint.storage == "s3rdma":
++        uri = build_checkpoint_uri(cfg.s3.uri, suffix)
++        logger.info("Saving checkpoint to %s (S3) using RDMA...", uri)
++        return S3CuStorageWriter(cfg.s3.region, uri, thread_count=cfg.thread_count)    
+     raise ValueError(f"Storage writer {cfg.checkpoint.storage} not supported")
+ 
+ 
+diff --git a/s3torchbenchmarking/src/s3torchbenchmarking/lightning_checkpointing/benchmark.py b/s3torchbenchmarking/src/s3torchbenchmarking/lightning_checkpointing/benchmark.py
+index 8a5121e..71dd985 100644
+--- a/s3torchbenchmarking/src/s3torchbenchmarking/lightning_checkpointing/benchmark.py
++++ b/s3torchbenchmarking/src/s3torchbenchmarking/lightning_checkpointing/benchmark.py
+@@ -23,6 +23,7 @@ from s3torchbenchmarking.lightning_checkpointing.checkpoint_profiler import (
+ )
+ from s3torchbenchmarking.models import get_benchmark_model, LightningAdapter
+ from s3torchconnector.lightning import S3LightningCheckpoint
++from s3cutorchconnector.lightning import S3LightningCheckpoint as S3CuLightningCheckpoint  # type: ignore
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -35,12 +36,16 @@ def run_benchmark(config: DictConfig) -> dict:
+ 
+     strategy = SingleDeviceStrategy()
+ 
+-    if config.checkpoint.storage == "disk":
+-        checkpoint_callback = callbacks.ModelCheckpoint(dirpath=config.path)
+-        checkpoint_io = strategy.checkpoint_io
+-    else:
+-        checkpoint_callback = callbacks.ModelCheckpoint(dirpath=config.s3.uri)
+-        checkpoint_io = S3LightningCheckpoint(config.s3.region)
++    match config.checkpoint.storage:
++        case "disk":
++            checkpoint_callback = callbacks.ModelCheckpoint(dirpath=config.path)
++            checkpoint_io = strategy.checkpoint_io
++        case "s3":
++            checkpoint_callback = callbacks.ModelCheckpoint(dirpath=config.s3.uri)
++            checkpoint_io = S3LightningCheckpoint(config.s3.region)
++        case "s3rdma":
++            checkpoint_callback = callbacks.ModelCheckpoint(dirpath=config.s3.uri)
++            checkpoint_io = S3CuLightningCheckpoint(config.s3.region)
+ 
+     profiling_checkpointer = CheckpointProfiler(checkpoint_io)
+     trainer = Trainer(
+diff --git a/s3torchbenchmarking/src/s3torchbenchmarking/models.py b/s3torchbenchmarking/src/s3torchbenchmarking/models.py
+index dce00bc..037507e 100644
+--- a/s3torchbenchmarking/src/s3torchbenchmarking/models.py
++++ b/s3torchbenchmarking/src/s3torchbenchmarking/models.py
+@@ -33,7 +33,7 @@ from s3torchconnector.lightning import S3LightningCheckpoint
+ from .benchmark_utils import ExperimentResult, ResourceMonitor
+ from .lightning_checkpointing.checkpoint_profiler import CheckpointProfiler
+ from .lightning_checkpointing.sample_counter import SampleCounter
+-
++import s3cutorchconnector
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -110,7 +110,7 @@ class ModelInterface(ABC):
+ 
+     def load_sample(self, sample: Union[S3Reader, Tuple[str, IOBase]]):
+         """Transform given sample (a file-like Object) to a model's input"""
+-        if isinstance(sample, S3Reader):
++        if isinstance(sample, S3Reader) or isinstance(sample, s3cutorchconnector.S3Reader):
+             key, data = sample.key, sample
+         else:
+             key, data = sample
+diff --git a/s3torchbenchmarking/src/s3torchbenchmarking/pytorch_checkpointing/benchmark.py b/s3torchbenchmarking/src/s3torchbenchmarking/pytorch_checkpointing/benchmark.py
+index 027b8b5..d4d669c 100644
+--- a/s3torchbenchmarking/src/s3torchbenchmarking/pytorch_checkpointing/benchmark.py
++++ b/s3torchbenchmarking/src/s3torchbenchmarking/pytorch_checkpointing/benchmark.py
+@@ -18,6 +18,7 @@ from s3torchbenchmarking.benchmark_utils import (
+ )
+ from s3torchbenchmarking.models import get_benchmark_model
+ from s3torchconnector import S3Checkpoint
++import s3cutorchconnector  # type: ignore
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -62,11 +63,13 @@ def run_benchmark(config: DictConfig) -> Dict[str, Any]:
+ 
+     try:
+         benchmark_model = get_benchmark_model(config.model)
+-        checkpoint = (
+-            None
+-            if config.checkpoint.storage == "disk"
+-            else S3Checkpoint(region=config.s3.region)
+-        )
++        match config.checkpoint.storage:
++            case "disk":
++                checkpoint = None
++            case "s3":
++                checkpoint = S3Checkpoint(region=config.s3.region)
++            case "s3rdma":
++                checkpoint = s3cutorchconnector.S3Checkpoint(region=config.s3.region)
+ 
+         suffix = build_random_suffix()
+         if config.checkpoint.storage == "disk":

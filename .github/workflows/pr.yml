@@ -1,0 +1,14 @@
+name: CI
+
+on:
+  pull_request:
+
+jobs:
+  lint:
+    name: Linters
+    runs-on: [self-hosted, small]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python lint
+        run: source ./venv.sh && ./python-lint.sh
