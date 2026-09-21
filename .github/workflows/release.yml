@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.1.0 (no 'v' prefix)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Linters
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python lint
+        run: source ./venv.sh && ./python-lint.sh
+
+  integration-tests:
+    name: Integration tests
+    uses: ./.github/workflows/dispatch-integration-tests.yml
+    with:
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  release:
+    name: Create release
+    needs: [lint, integration-tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure tag does not already exist
+        run: |
+          if git ls-remote --tags origin "refs/tags/v${{ inputs.version }}" | grep -q .; then
+            echo "Tag v${{ inputs.version }} already exists" >&2
+            exit 1
+          fi
+
+      - name: Set package version
+        run: sed -i 's/^version = ".*"/version = "${{ inputs.version }}"/' s3cutorchconnector/pyproject.toml
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add s3cutorchconnector/pyproject.toml
+          git commit -m "Release v${{ inputs.version }}"
+          git push origin HEAD:${{ github.ref }}
+
+      - name: Tag release
+        run: |
+          git tag "v${{ inputs.version }}"
+          git push origin "v${{ inputs.version }}"
+
+      - name: Build sdist and wheel
+        run: |
+          source ./venv.sh
+          pip install --upgrade build
+          cd s3cutorchconnector
+          python -m build
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ inputs.version }}" \
+            s3cutorchconnector/dist/* \
+            --title "v${{ inputs.version }}" \
+            --generate-notes
