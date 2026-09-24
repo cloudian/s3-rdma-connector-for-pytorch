@@ -23,52 +23,33 @@ jobs:
     # workflow's own 90-minute timeout.
     timeout-minutes: 105
     steps:
+      # workflow_dispatch (not repository_dispatch) targets the internal
+      # repo's integration-tests.yml by name and, on API version 2026-03-10+,
+      # returns workflow_run_id directly - no need to poll and guess which
+      # run resulted from the dispatch.
       - name: Trigger integration tests (internal repo)
         id: dispatch
         env:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}
         run: |
-          since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          gh api repos/cloudian/s3-rdma-connector-for-pytorch-internal/dispatches \
-            -f event_type=integration-tests \
-            -F "client_payload[sha]=${{ inputs.sha }}"
-          echo "since=$since" >> "$GITHUB_OUTPUT"
+          run_id=$(gh api repos/cloudian/s3-rdma-connector-for-pytorch-internal/actions/workflows/integration-tests.yml/dispatches \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            -f ref=main \
+            -F "inputs[sha]=${{ inputs.sha }}" \
+            --jq .workflow_run_id)
 
-      # The internal workflow doesn't report status back to this repo, so
-      # poll its run directly. Looked up repo-wide (not by workflow file) so
-      # this file doesn't need to name the internal workflow. Correlates by
-      # "first run created since we dispatched" - good enough given the
-      # internal workflow's own concurrency group serializes these runs one
-      # at a time.
-      - name: Wait for integration tests run to start
-        id: find_run
-        env:
-          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
-          REPO: cloudian/s3-rdma-connector-for-pytorch-internal
-          SINCE: ${{ steps.dispatch.outputs.since }}
-        run: |
-          run_id=""
-          for i in $(seq 1 30); do
-            run_id=$(gh api "repos/$REPO/actions/runs?event=repository_dispatch&per_page=10" \
-              --jq "[.workflow_runs[] | select(.created_at >= \"$SINCE\")] | sort_by(.created_at) | .[0].id // empty")
-            if [ -n "$run_id" ]; then
-              break
-            fi
-            sleep 10
-          done
-
-          if [ -z "$run_id" ]; then
-            echo "Could not find the dispatched integration tests run in $REPO" >&2
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "Dispatch response did not include workflow_run_id - check the API version pin above" >&2
             exit 1
           fi
-          echo "Watching $REPO run $run_id"
+          echo "Watching run $run_id"
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
 
       - name: Wait for integration tests to complete
         env:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}
           REPO: cloudian/s3-rdma-connector-for-pytorch-internal
-          RUN_ID: ${{ steps.find_run.outputs.run_id }}
+          RUN_ID: ${{ steps.dispatch.outputs.run_id }}
         run: |
           for i in $(seq 1 100); do
             status=$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq .status)
