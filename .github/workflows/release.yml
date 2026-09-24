@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.1.0 (no 'v' prefix)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Linters
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Python lint
+        run: source ./venv.sh && ./python-lint.sh
+
+  integration-tests:
+    name: Integration tests
+    uses: ./.github/workflows/dispatch-integration-tests.yml
+    with:
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  release:
+    name: Create release
+    needs: [lint, integration-tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Validate inputs.version is a valid version number
+      - name: Validate version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must look like X.Y.Z (no leading v, no build metadata): '$VERSION'" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "TAG=v$VERSION" >> "$GITHUB_ENV"
+
+      - name: Ensure tag does not already exist
+        run: |
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "Tag $TAG already exists" >&2
+            exit 1
+          fi
+
+      - name: Set package version
+        run: sed -i "s/^version = \".*\"/version = \"$VERSION\"/" s3cutorchconnector/pyproject.toml
+
+      # Build before pushing any commit or tag
+      - name: Build sdist and wheel
+        run: |
+          source ./venv.sh
+          pip install --upgrade build
+          cd s3cutorchconnector
+          python -m build
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add s3cutorchconnector/pyproject.toml
+          git commit -m "Release $TAG"
+          git push origin HEAD:${{ github.ref }}
+
+      - name: Tag release
+        run: |
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$TAG" \
+            s3cutorchconnector/dist/* \
+            --title "$TAG" \
+            --generate-notes
